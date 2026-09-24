@@ -31,6 +31,14 @@ func New(cfg *config.Prest) *negroni.Negroni {
 				AllowCredentials: cfg.CORSAllowCredentials,
 			}))
 	}
+	if cfg.Guard.Enabled {
+		guardHandler, err := GuardMiddleware(cfg.Guard)
+		if err != nil {
+			stack = append(stack, invalidGuardConfigMiddleware(err))
+		} else {
+			stack = append(stack, guardHandler)
+		}
+	}
 	if !cfg.Debug && cfg.EnableDefaultJWT {
 		jwtMiddleware, err := JwtMiddleware(
 			cfg.JWTKey, cfg.JWTJWKS, cfg.JWTAlgo, cfg.JWTWhiteList)

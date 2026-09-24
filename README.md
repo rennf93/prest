@@ -69,6 +69,31 @@ Prefer binding for anything user-supplied — search phrases especially, since a
 phrase containing a common word such as `do`, `as` or `or` is exactly what the
 interpolation screen refuses.
 
+## Request security (opt-in)
+
+The `[guard]` config section (env: `PREST_GUARD_*`) adds per-client rate
+limiting, request payload inspection, and IP policy as a middleware that runs
+before auth — off by default, and pREST behaves exactly as before without it:
+
+```toml
+[guard]
+enabled = true
+# passive = true              # log what would be blocked, reject nothing
+rate_limit = 100              # requests per client IP...
+rate_limit_window = 60        # ...per this many seconds (0 = no rate limit)
+max_body_bytes = 1048576      # how much body the inspection layer reads
+# blacklist = ["203.0.113.0/24"]
+# whitelist = ["198.51.100.7"]
+# exclude_paths = ["/health"]
+# redis_url = "redis://localhost:6379"  # share limits/bans across instances
+# block_cloud_providers = ["AWS", "GCP", "Azure"]
+```
+
+With `passive = true` the guard records what it would have blocked instead of
+rejecting requests, so rules can be previewed before enforcing. Without
+`redis_url`, rate limit and ban state is per instance. The middleware
+complements a reverse proxy/edge layer; it does not replace it.
+
 ## 1-Click Deploy
 
 ### Heroku
