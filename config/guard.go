@@ -1,7 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -19,6 +22,12 @@ const (
 type GuardConf struct {
 	// Enabled turns the guard middleware on. Default false.
 	Enabled bool
+	// Invalid carries a config error that makes the guard unusable, such as a
+	// PREST_GUARD_ENABLED value that is not a valid boolean. Parse cannot
+	// return errors, so invalidity is carried here and GuardMiddleware fails
+	// closed (every request answers 500) instead of silently running without
+	// the security the operator asked for. Nil means the config parsed fine.
+	Invalid error
 	// Passive makes the guard log what it would have blocked instead of
 	// rejecting requests. Use it to preview rules before enforcing.
 	Passive bool
@@ -34,8 +43,13 @@ type GuardConf struct {
 	// (both empty by default).
 	Blacklist []string
 	Whitelist []string
-	// ExcludePaths skips guard checks for these path prefixes.
+	// ExcludePaths skips all guard checks (including rate limits) for these
+	// paths and their subtrees.
 	ExcludePaths []string
+	// TrustedProxies lists proxy IPs/CIDRs whose X-Forwarded-For header is
+	// trusted when resolving the real client IP. Empty (default) means
+	// forwarded headers are ignored and the direct peer is used as client.
+	TrustedProxies []string
 	// RedisURL, when set, shares rate limit and ban state across instances.
 	// When empty, state is per-instance (in memory).
 	RedisURL string
@@ -50,7 +64,30 @@ type GuardConf struct {
 // PREST_GUARD_* prefix.
 func parseGuardConfig(v *viper.Viper, cfg *Prest) {
 	g := &cfg.Guard
-	g.Enabled = v.GetBool("guard.enabled")
+
+	// viper's GetBool silently discards conversion errors, which would turn a
+	// typo like PREST_GUARD_ENABLED=yes into "guard off". Validate the raw
+	// value instead: an explicitly set but non-boolean value marks the whole
+	// guard config invalid so the middleware fails closed.
+	switch raw := v.Get("guard.enabled").(type) {
+	case nil:
+		// Nothing set anywhere: keep the default (disabled).
+	case bool:
+		g.Enabled = raw
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			g.Invalid = fmt.Errorf("guard.enabled: %q is not a valid boolean", raw)
+			slog.Error("invalid guard config, guard requests will fail closed", "err", g.Invalid)
+			return
+		}
+		g.Enabled = parsed
+	default:
+		g.Invalid = fmt.Errorf("guard.enabled: unsupported value %v", raw)
+		slog.Error("invalid guard config, guard requests will fail closed", "err", g.Invalid)
+		return
+	}
+
 	g.Passive = v.GetBool("guard.passive")
 	g.RateLimit = v.GetInt("guard.rate_limit")
 	g.RateLimitWindow = v.GetInt("guard.rate_limit_window")
@@ -58,6 +95,7 @@ func parseGuardConfig(v *viper.Viper, cfg *Prest) {
 	g.Blacklist = v.GetStringSlice("guard.blacklist")
 	g.Whitelist = v.GetStringSlice("guard.whitelist")
 	g.ExcludePaths = v.GetStringSlice("guard.exclude_paths")
+	g.TrustedProxies = v.GetStringSlice("guard.trusted_proxies")
 	g.RedisURL = v.GetString("guard.redis_url")
 	g.RedisPrefix = v.GetString("guard.redis_prefix")
 	g.BlockCloudProviders = v.GetStringSlice("guard.block_cloud_providers")
