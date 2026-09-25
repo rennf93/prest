@@ -243,6 +243,22 @@ func TestGuardTrustedProxyResolution(t *testing.T) {
 		require.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
+	t.Run("forwarded header split across lines joins hops", func(t *testing.T) {
+		n := newGuardOnlyStack(t, func(g *config.GuardConf) {
+			g.TrustedProxies = []string{"10.0.0.9", "10.0.0.8"}
+			g.Blacklist = []string{"1.2.3.4/32"}
+		})
+		req := httptest.NewRequest(http.MethodGet, "/teste", nil)
+		req.RemoteAddr = "10.0.0.9:54321"
+		// A proxy that appends a second X-Forwarded-For header line instead of
+		// joining its hop into the existing value: the spoofable 9.9.9.9 must
+		// not shadow the real client 1.2.3.4 recorded by the trusted proxy.
+		req.Header["X-Forwarded-For"] = []string{"9.9.9.9", "1.2.3.4, 10.0.0.9"}
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusForbidden, rec.Code)
+	})
+
 	t.Run("unlisted client behind trusted proxy is allowed", func(t *testing.T) {
 		n := newGuardOnlyStack(t, func(g *config.GuardConf) {
 			g.TrustedProxies = []string{"10.0.0.9"}
@@ -301,4 +317,67 @@ func TestGuardBodyScan(t *testing.T) {
 		require.Contains(t, logs.String(), "guard request blocked")
 		require.Contains(t, logs.String(), "check=suspicious_activity")
 	})
+
+	t.Run("whitelisted client skips body scan", func(t *testing.T) {
+		n := newGuardOnlyStack(t, func(g *config.GuardConf) {
+			g.Whitelist = []string{"198.51.100.7"}
+		})
+		req := httptest.NewRequest(http.MethodPost, "/teste",
+			strings.NewReader(`{"name": "1' OR '1'='1"}`))
+		req.RemoteAddr = "198.51.100.7:54321"
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, `{"name": "1' OR '1'='1"}`, rec.Body.String())
+	})
+
+	t.Run("non-whitelisted client denied by engine before body scan", func(t *testing.T) {
+		n := newGuardOnlyStack(t, func(g *config.GuardConf) {
+			g.Whitelist = []string{"198.51.100.7"}
+		})
+		req := httptest.NewRequest(http.MethodPost, "/teste",
+			strings.NewReader(`{"name": "1' OR '1'='1"}`))
+		req.RemoteAddr = "198.51.100.8:54321"
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		// With a whitelist configured the engine denies everyone else outright,
+		// so the body scan's 400 must not preempt the engine's 403.
+		require.Equal(t, http.StatusForbidden, rec.Code)
+	})
+}
+
+// TestGuardEngineRunsBeforeBodyScan verifies the engine's verdicts take
+// precedence over the body scan: over-limit clients get the engine's 429 and
+// blacklisted peers get the engine's 403 even when the body also carries an
+// attack payload.
+func TestGuardEngineRunsBeforeBodyScan(t *testing.T) {
+	n := newGuardOnlyStack(t, func(g *config.GuardConf) {
+		g.RateLimit = 1
+		g.RateLimitWindow = 60
+	})
+
+	// The first request consumes the single-request rate limit budget.
+	res := serveGuardRequest(n, "/teste")
+	require.Equal(t, http.StatusOK, res.Code)
+
+	// The next request carries a body-only payload: the engine's 429 must win
+	// over the body scan's 400.
+	req := httptest.NewRequest(http.MethodPost, "/teste",
+		strings.NewReader(`{"name": "1' OR '1'='1"}`))
+	req.RemoteAddr = "192.0.2.1:1234"
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+	// A blacklisted peer with an attack body gets the engine's 403, not the
+	// body scan's 400.
+	n = newGuardOnlyStack(t, func(g *config.GuardConf) {
+		g.Blacklist = []string{"198.51.100.0/24"}
+	})
+	req = httptest.NewRequest(http.MethodPost, "/teste",
+		strings.NewReader(`{"name": "1' OR '1'='1"}`))
+	req.RemoteAddr = "198.51.100.7:54321"
+	rec = httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
 }

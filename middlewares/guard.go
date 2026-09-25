@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	guardcore "github.com/rennf93/guard-core-go/v4/guardcore"
@@ -89,6 +90,7 @@ func GuardMiddleware(conf config.GuardConf) (negroni.Handler, error) {
 	}
 
 	exclusions := newPathExclusions(conf.ExcludePaths)
+	whitelist := newIPList(conf.Whitelist)
 
 	return negroni.HandlerFunc(func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 		// The engine still enforces some checks (rate limits, IP policy) on
@@ -101,14 +103,27 @@ func GuardMiddleware(conf config.GuardConf) (negroni.Handler, error) {
 
 		applyTrustedProxy(r, trustedProxies)
 
-		if scanRequestBody(r, maxBodyBytes, requestClientHost(r), conf.Passive) {
-			// Mirror the engine's suspicious_activity rejection shape.
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(guardcore.SuspiciousBlockedMsg))
-			return
-		}
-
-		wrap(next).ServeHTTP(w, r)
+		// The engine runs before the body scan so its verdicts take
+		// precedence: whitelisted clients keep full trust, blacklisted peers
+		// get 403, over-limit clients get 429, and only then does a body-only
+		// payload earn the 400. guard-core-go v4 has no exported API to feed
+		// these findings into its violation counter, so body-only threats do
+		// not contribute to auto-ban accounting.
+		wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Whitelisted clients are fully trusted by the engine (its IP,
+			// rate limit, and penetration checks all skip them), so the body
+			// scan does not apply to them either. Membership is checked per
+			// client rather than skipping the scan whenever a whitelist is
+			// configured, so body inspection still covers everyone else.
+			clientIP := requestClientHost(r)
+			if !whitelist.contains(clientIP) && scanRequestBody(r, maxBodyBytes, clientIP, conf.Passive) {
+				// Mirror the engine's suspicious_activity rejection shape.
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(guardcore.SuspiciousBlockedMsg))
+				return
+			}
+			next(w, r)
+		})).ServeHTTP(w, r)
 	}), nil
 }
 
@@ -225,7 +240,10 @@ func applyTrustedProxy(r *http.Request, trusted *trustedProxySet) {
 	if !trusted.contains(peer) {
 		return
 	}
-	xff := r.Header.Get("X-Forwarded-For")
+	// Header.Values joins every X-Forwarded-For line: some proxies append a
+	// new header line instead of joining their hop into the existing value,
+	// and taking only the first line would trust client-supplied data.
+	xff := strings.Join(r.Header.Values("X-Forwarded-For"), ",")
 	if strings.TrimSpace(xff) == "" {
 		return
 	}
@@ -284,6 +302,56 @@ func newPathExclusions(entries []string) *pathExclusions {
 func (p *pathExclusions) matches(path string) bool {
 	for _, entry := range p.entries {
 		if entry == "/" || path == entry || strings.HasPrefix(path, entry+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// ipList is a pre-parsed whitelist entry set mirroring the engine's
+// ipMatchesList semantics: entries are exact IPs or CIDRs, and matching
+// accepts both the address and its IPv4-mapped form.
+type ipList struct {
+	ips  map[string]bool
+	nets []netip.Prefix
+}
+
+// newIPList parses whitelist entries. The engine already validated them at
+// startup, so entries that fail to parse here are skipped rather than fatal.
+func newIPList(entries []string) *ipList {
+	list := &ipList{ips: make(map[string]bool, len(entries))}
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if prefix, err := netip.ParsePrefix(entry); err == nil {
+				list.nets = append(list.nets, prefix)
+			}
+			continue
+		}
+		if addr, err := netip.ParseAddr(entry); err == nil {
+			list.ips[addr.String()] = true
+		}
+	}
+	return list
+}
+
+// contains reports whether ip belongs to the list.
+func (l *ipList) contains(ip string) bool {
+	if l == nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	if l.ips[addr.String()] {
+		return true
+	}
+	for _, prefix := range l.nets {
+		if prefix.Contains(addr.Unmap()) || prefix.Contains(addr) {
 			return true
 		}
 	}
